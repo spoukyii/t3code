@@ -1327,6 +1327,146 @@ describe("OrchestratorMcpService provider resolution", () => {
     );
   });
 
+  describe("usage limits", () => {
+    const claudeInstanceId = ProviderInstanceId.make("claudeAgent");
+    const claudeWorkInstanceId = ProviderInstanceId.make("claudeAgent_work");
+    const checkedAt = "2026-10-24T09:00:00.000Z";
+    const resetsAt = "2026-10-27T05:00:00.000Z";
+    const weekly = (usedPercent: number): ServerProvider["usageLimits"] => ({
+      checkedAt,
+      windows: [{ id: "seven_day", kind: "weekly", label: "Weekly", usedPercent, resetsAt }],
+    });
+    const claudeSnapshot = (instanceId: ProviderInstanceId, usedPercent: number) => ({
+      ...providerSnapshot({
+        instanceId,
+        driver: ProviderDriverKind.make("claudeAgent"),
+        model: "claude-opus",
+      }),
+      usageLimits: weekly(usedPercent),
+    });
+    const providers: ReadonlyArray<ServerProvider> = [
+      providerSnapshot({
+        instanceId: codexInstanceId,
+        driver: ProviderDriverKind.make("codex"),
+        model: "gpt-5.4",
+      }),
+      claudeSnapshot(claudeInstanceId, 100),
+      claudeSnapshot(claudeWorkInstanceId, 37.5),
+    ];
+
+    const withService = <A, E>(
+      use: (
+        service: OrchestratorMcpService.OrchestratorMcpService["Service"],
+        dispatched: Ref.Ref<
+          ReadonlyArray<{ readonly modelSelection: { readonly instanceId: string } }>
+        >,
+        replaying: Ref.Ref<boolean>,
+      ) => Effect.Effect<A, E>,
+    ) =>
+      Effect.gen(function* () {
+        const dispatched = yield* Ref.make<
+          ReadonlyArray<{ readonly modelSelection: { readonly instanceId: string } }>
+        >([]);
+        const replaying = yield* Ref.make(false);
+        const task = {
+          id: taskId,
+          threadId: parentThreadId,
+          runId: parentRunId,
+          parentNodeId,
+          origin: "app_owned",
+          createdBy: "agent",
+          driver: ProviderDriverKind.make("claudeAgent"),
+          providerInstanceId: claudeWorkInstanceId,
+          providerThreadId: null,
+          childThreadId,
+          nativeTaskRef: null,
+          prompt: "Summarize the diff.",
+          title: null,
+          model: "claude-opus",
+          status: "running",
+          result: null,
+          startedAt: null,
+          completedAt: null,
+        };
+        const layerDependencies = Layer.mergeAll(
+          NodeServices.layer,
+          Layer.mock(ThreadManagementService.ThreadManagementService)({
+            hasReceipt: () => Ref.get(replaying),
+            getThreadRecords: (threadId) =>
+              Ref.get(dispatched).pipe(
+                Effect.map((commands) =>
+                  threadId === parentThreadId
+                    ? parentProjection(commands.length > 0 ? [task] : [])
+                    : childProjection,
+                ),
+              ),
+            dispatch: (command) =>
+              Ref.update(dispatched, (commands) => [
+                ...commands,
+                command as unknown as { readonly modelSelection: { readonly instanceId: string } },
+              ]).pipe(
+                Effect.as({
+                  sequence: 1,
+                  storedEvents: [
+                    {
+                      sequence: 1,
+                      commandId: null,
+                      event: { type: "subagent.updated", payload: task },
+                    },
+                  ],
+                } as never),
+              ),
+          }),
+          providerRegistryLayer(providers),
+          adapterRegistryLayer(providers.map((provider) => provider.instanceId)),
+          Layer.mock(ProjectService.ProjectService)({}),
+          Layer.mock(SecretRequests.SecretRequests)({}),
+          Layer.mock(ScheduledTaskService.ScheduledTaskService)({}),
+          ServerSettings.layerTest(),
+        );
+        return yield* Effect.gen(function* () {
+          return yield* use(
+            yield* OrchestratorMcpService.OrchestratorMcpService,
+            dispatched,
+            replaying,
+          );
+        }).pipe(Effect.provide(layerOrchestratorService.pipe(Layer.provide(layerDependencies))));
+      });
+
+    it.effect("capabilities report each instance's usage windows, or null without data", () =>
+      withService((service) =>
+        Effect.gen(function* () {
+          const capabilities = yield* service.capabilities(scope);
+          assert.deepEqual(
+            capabilities.providers.map((provider) => ({
+              id: provider.providerInstanceId,
+              canRunChildTask: provider.canRunChildTask,
+              constraints: provider.constraints,
+              usage: provider.usage,
+            })),
+            [
+              { id: codexInstanceId, canRunChildTask: true, constraints: [], usage: null },
+              {
+                id: claudeInstanceId,
+                canRunChildTask: false,
+                constraints: [
+                  "Out of usage until 2026-10-27T05:00:00.000Z, when its Weekly window resets.",
+                ],
+                usage: { checkedAt, windows: [{ label: "Weekly", usedPercent: 100, resetsAt }] },
+              },
+              {
+                id: claudeWorkInstanceId,
+                canRunChildTask: true,
+                constraints: [],
+                usage: { checkedAt, windows: [{ label: "Weekly", usedPercent: 37, resetsAt }] },
+              },
+            ],
+          );
+        }),
+      ),
+    );
+  });
+
   it.effect("rejects delegation to a provider without a registered adapter", () =>
     Effect.gen(function* () {
       const forkOnlyInstanceId = ProviderInstanceId.make("forkOnly");

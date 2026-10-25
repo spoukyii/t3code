@@ -16,6 +16,7 @@ import {
   type OrchestratorMcpCapabilitiesInput,
   type OrchestratorMcpCapabilitiesResult,
   type OrchestratorMcpModelOption,
+  type OrchestratorMcpProviderCapability,
   type OrchestratorMcpCreateThreadsInput,
   type OrchestratorMcpCreateThreadsResult,
   type OrchestratorMcpCreatedThread,
@@ -66,6 +67,7 @@ import {
   isOrchestrationV2WorkActive,
 } from "@t3tools/contracts";
 import { getProviderOptionCurrentValue } from "@t3tools/shared/model";
+import { type ExhaustedUsageWindow, exhaustedUsageWindow } from "@t3tools/shared/usageLimits";
 import { runRanAfter } from "@t3tools/shared/orchestrationV2ThreadError";
 import {
   normalizeThreadPullRequestKey,
@@ -394,6 +396,24 @@ function providerConstraints(
     constraints.push("Provider is not authenticated.");
   }
   return constraints;
+}
+
+function outOfUsage(window: ExhaustedUsageWindow): string {
+  return `Out of usage until ${window.resetsAt}, when its ${window.label} window resets.`;
+}
+
+/** Null without usage numbers, so an agent can tell an unknown from an idle account. */
+function capabilityUsage(provider: ServerProvider): OrchestratorMcpProviderCapability["usage"] {
+  const limits = provider.usageLimits;
+  if (limits === undefined || limits.windows.length === 0) return null;
+  return {
+    checkedAt: limits.checkedAt,
+    windows: limits.windows.map(({ label, usedPercent, resetsAt }) => ({
+      label,
+      usedPercent: Math.floor(usedPercent),
+      ...(resetsAt === undefined ? {} : { resetsAt }),
+    })),
+  };
 }
 
 /**
@@ -2087,6 +2107,7 @@ const make = Effect.gen(function* () {
       );
       const inherited = parent?.thread.modelSelection;
       const searchTerms = input.search?.toLowerCase().split(/\s+/) ?? [];
+      const nowMs = yield* Clock.currentTimeMillis;
       return {
         parentThreadId: parent?.thread.id ?? null,
         inheritedProviderInstanceId: inherited?.instanceId ?? null,
@@ -2095,10 +2116,14 @@ const make = Effect.gen(function* () {
         runtimeMode: limits.runtimeMode,
         interactionMode: limits.interactionMode,
         providers: providers.map((provider) => {
-          const constraints = providerConstraints(
-            provider,
-            orchestrationCapableInstanceIds.has(provider.instanceId),
-          );
+          const full = exhaustedUsageWindow(provider, nowMs);
+          const constraints = [
+            ...providerConstraints(
+              provider,
+              orchestrationCapableInstanceIds.has(provider.instanceId),
+            ),
+            ...(full === undefined ? [] : [outOfUsage(full)]),
+          ];
           const { listed, omitted } = listCapabilityModels({
             provider,
             preferences: settings.providerModelPreferences?.[provider.instanceId],
@@ -2132,7 +2157,8 @@ const make = Effect.gen(function* () {
               : { runtimeModes: [...provider.supportedRuntimeModes] }),
             canRunChildTask: constraints.length === 0,
             canRunCrossProviderChildTask: constraints.length === 0,
-            constraints: [...constraints],
+            constraints,
+            usage: capabilityUsage(provider),
           };
         }),
         features: {

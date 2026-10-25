@@ -201,11 +201,14 @@ Returns:
 - the inherited provider instance and model;
 - the parent runtime and interaction modes;
 - registered provider instances and advertised models;
-- whether each provider can run a child task; and
+- whether each provider can run a child task;
+- each provider's usage windows from its snapshot, or `null` without usage
+  numbers; and
 - feature flags for polling, cancellation, and batch thread creation.
 
 Unavailable providers include model-visible constraints such as missing V2
-adapter support, disabled state, missing executable, or missing authentication.
+adapter support, disabled state, missing executable, missing authentication, or
+usage exhausted until a window resets.
 
 The model list is short on purpose: catalogs such as OpenCode can hold hundreds
 of models, and every call lands in the agent's context. Each provider lists
