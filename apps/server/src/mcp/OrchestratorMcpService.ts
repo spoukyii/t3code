@@ -417,6 +417,43 @@ function capabilityUsage(provider: ServerProvider): OrchestratorMcpProviderCapab
 }
 
 /**
+ * Refuses an agent's launch on an instance that is out of usage until a reset
+ * still ahead, and names the instances that have room. An instance without
+ * usage numbers is never refused.
+ */
+export function usageLimitFailure(
+  providers: ReadonlyArray<ServerProvider>,
+  instanceId: ProviderInstanceId,
+  nowMs: number,
+): OrchestratorMcpFailure | undefined {
+  const provider = providers.find((candidate) => candidate.instanceId === instanceId);
+  const full = provider === undefined ? undefined : exhaustedUsageWindow(provider, nowMs);
+  if (full === undefined) return undefined;
+  const instancesWithRoom = providers
+    .filter(
+      (candidate) =>
+        candidate !== provider &&
+        providerConstraints(candidate, true).length === 0 &&
+        exhaustedUsageWindow(candidate, nowMs) === undefined,
+    )
+    .map((candidate) => candidate.instanceId);
+  return new OrchestratorMcpFailure({
+    code: "usage_limit_reached",
+    message: `Provider instance ${instanceId}: ${outOfUsage(full)} ${
+      instancesWithRoom.length === 0
+        ? "No other provider instance has room."
+        : `Instances with room: ${instancesWithRoom.join(", ")}.`
+    }`,
+    usageLimit: {
+      providerInstanceId: instanceId,
+      window: full.label,
+      resetsAt: full.resetsAt,
+      instancesWithRoom,
+    },
+  });
+}
+
+/**
  * Models without descriptors skip the descriptor checks (mirroring how model slugs are only
  * validated when the provider advertises models), but duplicate ids always fail: downstream
  * consumers disagree on whether the first or last value of a duplicated id wins.
@@ -1371,11 +1408,11 @@ const make = Effect.gen(function* () {
     /**
      * Set only when the command that will dispatch this target already has a receipt: that
      * dispatch can only replay the recorded result, never start anything new, so filtering
-     * candidates by the project's current settings would just refuse a retry that does no new
-     * work. Never set this for a resolution whose dispatch uses a different command id than the
-     * one checked for a receipt.
+     * candidates by the project's current settings or the instance's usage would just refuse a
+     * retry that does no new work. Never set this for a resolution whose dispatch uses a
+     * different command id than the one checked for a receipt.
      */
-    readonly skipProjectEnablementFilter?: boolean;
+    readonly replaysAcceptedCommand?: boolean;
   }): Effect.fn.Return<ResolvedTarget, OrchestratorMcpFailure> {
     const requestedInstanceId = input.target?.providerInstanceId;
     const requestedDriver = input.target?.driverKind;
@@ -1406,7 +1443,7 @@ const make = Effect.gen(function* () {
       ];
       for (const candidate of orderedCandidates) {
         const enabledForProject =
-          input.skipProjectEnablementFilter === true ||
+          input.replaysAcceptedCommand === true ||
           (yield* threadManagement.isProviderInstanceEnabledForProject({
             projectId: input.parent.thread.projectId,
             instanceId: candidate.instanceId,
@@ -1449,6 +1486,14 @@ const make = Effect.gen(function* () {
         "provider_unavailable",
         `Provider ${instanceId} cannot run a child task: ${constraints.join(" ")}`,
       );
+    }
+    if (input.replaysAcceptedCommand !== true) {
+      const outOfUsageFailure = usageLimitFailure(
+        input.providers,
+        instanceId,
+        yield* Clock.currentTimeMillis,
+      );
+      if (outOfUsageFailure !== undefined) return yield* outOfUsageFailure;
     }
 
     const inheritedSelection = input.parent.thread.modelSelection;
@@ -2200,7 +2245,7 @@ const make = Effect.gen(function* () {
         parent,
         target: input.target,
         providers,
-        skipProjectEnablementFilter: isRetryOfAcceptedDelegation,
+        replaysAcceptedCommand: isRetryOfAcceptedDelegation,
       });
       const runtimeMode = yield* resolveRuntimeMode(
         parent.thread.runtimeMode,
@@ -2597,7 +2642,7 @@ const make = Effect.gen(function* () {
                         providerInstanceId: committedThread.modelSelection.instanceId,
                       },
                 providers,
-                skipProjectEnablementFilter: isRetryOfAcceptedCreation,
+                replaysAcceptedCommand: isRetryOfAcceptedCreation,
               });
               const runtimeMode = yield* resolveRuntimeMode(
                 parent.thread.runtimeMode,

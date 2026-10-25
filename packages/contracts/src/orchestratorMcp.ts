@@ -735,7 +735,16 @@ export class OrchestratorMcpFailure extends Schema.TaggedError<OrchestratorMcpFa
       "orchestration_error",
       "thread_credential_required",
       "target_required",
+      "usage_limit_reached",
     ]),
     message: Schema.String,
+    usageLimit: Schema.optional(
+      Schema.Struct({
+        providerInstanceId: ProviderInstanceId,
+        window: Schema.String,
+        resetsAt: IsoDateTime,
+        instancesWithRoom: Schema.Array(ProviderInstanceId),
+      }),
+    ),
   },
 ) {}

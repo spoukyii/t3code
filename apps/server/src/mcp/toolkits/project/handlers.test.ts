@@ -2,10 +2,12 @@ import { expect, it } from "@effect/vitest";
 import {
   EnvironmentId,
   ProjectId,
+  ProviderDriverKind,
   ProviderInstanceId,
   type Project as ProjectRecord,
   type ModelSelection,
   type RuntimeMode,
+  type ServerProvider,
 } from "@t3tools/contracts";
 import * as NodeCrypto from "@effect/platform-node/NodeCrypto";
 import * as NodeServices from "@effect/platform-node/NodeServices";
@@ -22,6 +24,7 @@ import * as ServerConfig from "../../../config.ts";
 import * as ServerSettings from "../../../serverSettings.ts";
 import * as Project from "../../../project/ProjectService.ts";
 import * as ManagedProjectFolders from "../../../project/ManagedProjectFolders.ts";
+import * as ProviderRegistry from "../../../provider/ProviderRegistry.ts";
 import * as GitVcsDriver from "../../../vcs/GitVcsDriver.ts";
 import * as VcsProcess from "../../../vcs/VcsProcess.ts";
 import * as McpInvocationContext from "../../McpInvocationContext.ts";
@@ -37,6 +40,7 @@ const clientLaunchHarness = (input: {
   readonly launched: Array<ThreadLaunch.ThreadLaunchInput>;
   readonly workspaceRoot?: string;
   readonly checkWorktreeBase?: ThreadLaunch.ThreadLaunchService["Service"]["checkWorktreeBase"];
+  readonly providers?: ReadonlyArray<ServerProvider>;
 }) => {
   const projectId = ProjectId.make("project:client-target");
   const modelSelection = {
@@ -102,6 +106,9 @@ const clientLaunchHarness = (input: {
         ),
     }),
     Layer.mock(ManagedProjectFolders.ManagedProjectFolders)({ namedProjectsRoot: "/projects" }),
+    Layer.mock(ProviderRegistry.ProviderRegistry)({
+      getProviders: Effect.succeed(input.providers ?? []),
+    }),
     NodeServices.layer,
   ).pipe(
     Layer.provideMerge(GitVcsDriver.layer),
@@ -297,5 +304,86 @@ it.effect("a launch into a new worktree creates nothing when its base ref has no
 
     expect((yield* launchFrom("main")).at(-1)?.result).toMatchObject({ projectId });
     expect(launched).toHaveLength(1);
+  }),
+);
+
+it.effect("a launch on an instance out of usage is refused with the instances that have room", () =>
+  Effect.gen(function* () {
+    const snapshot = (
+      instanceId: string,
+      usageLimits?: ServerProvider["usageLimits"],
+    ): ServerProvider => ({
+      instanceId: ProviderInstanceId.make(instanceId),
+      driver: ProviderDriverKind.make(instanceId.startsWith("codex") ? "codex" : "claudeAgent"),
+      enabled: true,
+      installed: true,
+      version: "test",
+      status: "ready",
+      auth: { status: "authenticated" },
+      checkedAt: "2026-10-24T09:00:00.000Z",
+      models: [],
+      slashCommands: [],
+      skills: [],
+      ...(usageLimits === undefined ? {} : { usageLimits }),
+    });
+    const weekly = (usedPercent: number) => ({
+      checkedAt: "2026-10-24T09:00:00.000Z",
+      windows: [
+        {
+          id: "seven_day",
+          kind: "weekly" as const,
+          label: "Weekly",
+          usedPercent,
+          resetsAt: "2026-10-27T05:00:00.000Z",
+        },
+      ],
+    });
+    const launched: Array<ThreadLaunch.ThreadLaunchInput> = [];
+    const { projectId, dependencies } = clientLaunchHarness({
+      runtimeModeCeiling: "full-access",
+      launched,
+      providers: [
+        snapshot("claudeAgent", weekly(100)),
+        snapshot("claudeAgent_work", weekly(40)),
+        snapshot("codex"),
+      ],
+    });
+    const toolkit = yield* ProjectToolkit.pipe(
+      Effect.provide(
+        McpToolAccess.HandlersLayer.layer(ProjectHandlers.layer).pipe(Layer.provide(dependencies)),
+      ),
+    );
+    const launchOn = (instanceId?: string) =>
+      toolkit
+        .handle("t3_thread_launch", {
+          title: "Fix",
+          projectId,
+          ...(instanceId === undefined
+            ? {}
+            : {
+                modelSelection: { instanceId: ProviderInstanceId.make(instanceId), model: "m" },
+              }),
+        })
+        .pipe(Stream.unwrap, Stream.runCollect, Effect.provide(dependencies));
+
+    expect((yield* launchOn()).at(-1)?.result).toMatchObject({
+      code: "usage_limit_reached",
+      message:
+        "Provider instance claudeAgent: Out of usage until 2026-10-27T05:00:00.000Z, when its Weekly window resets. Instances with room: claudeAgent_work, codex.",
+      usageLimit: {
+        providerInstanceId: "claudeAgent",
+        window: "Weekly",
+        resetsAt: "2026-10-27T05:00:00.000Z",
+        instancesWithRoom: ["claudeAgent_work", "codex"],
+      },
+    });
+    expect(launched).toHaveLength(0);
+
+    yield* launchOn("claudeAgent_work");
+    yield* launchOn("codex");
+    expect(launched.map((launch) => launch.modelSelection.instanceId)).toEqual([
+      "claudeAgent_work",
+      "codex",
+    ]);
   }),
 );

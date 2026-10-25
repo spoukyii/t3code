@@ -6,6 +6,7 @@ import {
   MessageId,
   NodeId,
   type OrchestratorMcpCapabilitiesResult,
+  type OrchestratorMcpFailure,
   OrchestratorMcpTarget,
   type OrchestrationV2ThreadShell,
   type ScheduledTask,
@@ -1464,6 +1465,75 @@ describe("OrchestratorMcpService provider resolution", () => {
           );
         }),
       ),
+    );
+
+    it.effect("delegation and thread creation refuse an instance out of usage", () =>
+      withService((service, dispatched) =>
+        Effect.gen(function* () {
+          const refusal: Pick<OrchestratorMcpFailure, "code" | "message" | "usageLimit"> = {
+            code: "usage_limit_reached",
+            message:
+              "Provider instance claudeAgent: Out of usage until 2026-10-27T05:00:00.000Z, when its Weekly window resets. Instances with room: codex, claudeAgent_work.",
+            usageLimit: {
+              providerInstanceId: claudeInstanceId,
+              window: "Weekly",
+              resetsAt,
+              instancesWithRoom: [codexInstanceId, claudeWorkInstanceId],
+            },
+          };
+          const delegated = yield* service
+            .delegateTask(scope, {
+              task: "Summarize the diff.",
+              target: { providerInstanceId: claudeInstanceId },
+              mode: "async",
+              clientRequestId: "delegate-out-of-usage",
+            })
+            .pipe(Effect.flip);
+          assert.deepEqual(
+            { code: delegated.code, message: delegated.message, usageLimit: delegated.usageLimit },
+            refusal,
+          );
+          const created = yield* service
+            .createThreads(scope, {
+              threads: [{ target: { providerInstanceId: claudeInstanceId }, prompt: "Fix it." }],
+              clientRequestId: "create-out-of-usage",
+            })
+            .pipe(Effect.flip);
+          assert.deepEqual(
+            { code: created.code, message: created.message, usageLimit: created.usageLimit },
+            refusal,
+          );
+          assert.deepEqual(yield* Ref.get(dispatched), []);
+        }),
+      ),
+    );
+
+    it.effect(
+      "delegation runs on an instance with room or without usage data, and a retry of an accepted one replays",
+      () =>
+        withService((service, dispatched, replaying) =>
+          Effect.gen(function* () {
+            for (const providerInstanceId of [claudeWorkInstanceId, codexInstanceId]) {
+              yield* service.delegateTask(scope, {
+                task: "Summarize the diff.",
+                target: { providerInstanceId },
+                mode: "async",
+                clientRequestId: `delegate-${providerInstanceId}`,
+              });
+            }
+            yield* Ref.set(replaying, true);
+            yield* service.delegateTask(scope, {
+              task: "Summarize the diff.",
+              target: { providerInstanceId: claudeInstanceId },
+              mode: "async",
+              clientRequestId: "delegate-accepted-before-the-limit",
+            });
+            assert.deepEqual(
+              (yield* Ref.get(dispatched)).map((command) => command.modelSelection.instanceId),
+              [claudeWorkInstanceId, codexInstanceId, claudeInstanceId],
+            );
+          }),
+        ),
     );
   });
 

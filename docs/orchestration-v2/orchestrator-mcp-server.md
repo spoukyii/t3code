@@ -509,6 +509,11 @@ results use the latest assistant content from the final work turn.
   caller's. This is the same privilege ceiling as child creation.
 - Provider instances must be enabled, installed, available, authenticated, and
   backed by a V2 adapter.
+- `delegate_task`, `create_threads`, and `t3_thread_launch` refuse an instance
+  whose snapshot shows a full window with its reset still ahead, unless the call
+  replays an accepted command. Only windows that stop the whole account count
+  (`exhaustedUsageWindow` in `packages/shared/src/usageLimits.ts`); a per-model
+  or pooled window, or an instance without usage numbers, never refuses.
 - A requested model must be advertised by the selected provider when the
   provider publishes a model list.
 - `clientRequestId` derives stable command, thread, and message IDs within the
@@ -533,6 +538,7 @@ thread_not_sendable
 thread_not_interruptible
 invalid_request
 orchestration_error
+usage_limit_reached
 ```
 
 ## Code Ownership
