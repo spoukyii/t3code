@@ -3,6 +3,7 @@ import {
   ProviderDriverKind,
   ProviderInstanceId,
   type ServerProvider,
+  type ServerProviderUsageWindow,
   UsageLimitSourceId,
 } from "@t3tools/contracts";
 import { describe, expect, it } from "vite-plus/test";
@@ -17,6 +18,7 @@ import {
   collectLimitNotices,
   collectLimitPools,
   elapsedShare,
+  exhaustedUsageWindow,
   paceOf,
   paceRemainingPercent,
   usesChatGptSharing,
@@ -57,6 +59,76 @@ describe("pace", () => {
     expect(paceOf(window, now)).toBe("under");
     expect(paceOf({ ...window, usedPercent: 62 }, now)).toBe("on");
     expect(paceOf({ ...window, usedPercent: 80 }, now)).toBe("ahead");
+  });
+});
+
+describe("exhaustedUsageWindow", () => {
+  const claude = ProviderDriverKind.make("claudeAgent");
+  const weekly = {
+    id: "seven_day",
+    kind: "weekly",
+    label: "Weekly",
+    usedPercent: 100,
+    windowDurationMins: 7 * 24 * 60,
+    resetsAt: "2026-09-06T12:00:00.000Z",
+  } as const;
+  const limits = (...windows: ReadonlyArray<ServerProviderUsageWindow>) => ({
+    usageLimits: { checkedAt: "2026-09-03T11:00:00.000Z", windows },
+  });
+
+  it("names the full account window that resets last", () => {
+    const fullSession = { ...window, usedPercent: 100 };
+    expect(
+      exhaustedUsageWindow(provider({ driver: claude, ...limits(fullSession, weekly) }), now),
+    ).toEqual(weekly);
+    expect(exhaustedUsageWindow(provider({ driver: claude, ...limits(fullSession) }), now)).toEqual(
+      fullSession,
+    );
+    expect(
+      exhaustedUsageWindow(
+        provider({ ...limits({ ...weekly, id: "secondary", usedPercent: 100 }) }),
+        now,
+      ),
+    ).toEqual({ ...weekly, id: "secondary" });
+  });
+
+  it("leaves an account with room for some model, or with no reset ahead, runnable", () => {
+    const sonnetWeek = { ...weekly, id: "seven_day_sonnet", label: "Weekly · Sonnet" };
+    expect(exhaustedUsageWindow(provider({ driver: claude, ...limits(sonnetWeek) }), now)).toBe(
+      undefined,
+    );
+    expect(
+      exhaustedUsageWindow(
+        provider({
+          driver: ProviderDriverKind.make("cursor"),
+          ...limits({ ...weekly, id: "apiPercentUsed", kind: "monthly", label: "Other Models" }),
+        }),
+        now,
+      ),
+    ).toBe(undefined);
+    expect(
+      exhaustedUsageWindow(
+        provider({ driver: claude, ...limits(weekly) }),
+        Date.parse(weekly.resetsAt),
+      ),
+    ).toBe(undefined);
+    expect(exhaustedUsageWindow(provider({ driver: claude }), now)).toBe(undefined);
+  });
+
+  it("lets Claude extra usage with budget left carry an account past a full week", () => {
+    const spend = { id: "monthly_spend", kind: "monthly", label: "Monthly spend" } as const;
+    expect(
+      exhaustedUsageWindow(
+        provider({ driver: claude, ...limits(weekly, { ...spend, usedPercent: 60 }) }),
+        now,
+      ),
+    ).toBe(undefined);
+    expect(
+      exhaustedUsageWindow(
+        provider({ driver: claude, ...limits(weekly, { ...spend, usedPercent: 100 }) }),
+        now,
+      ),
+    ).toEqual(weekly);
   });
 });
 

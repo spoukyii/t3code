@@ -418,15 +418,66 @@ function poolKey(driver: ServerProvider["driver"], window: ServerProviderUsageWi
   return driver === "codex" ? window.kind : `${window.kind}:${window.id}`;
 }
 
+/**
+ * Whether reaching a window stops every model on the account. Claude's
+ * per-model week, Cursor's pools, Antigravity's model families and OpenCode Go
+ * leave other models running, and other drivers' windows are not known to.
+ */
+function stopsWholeAccount(
+  driver: ServerProvider["driver"],
+  window: ServerProviderUsageWindow,
+): boolean {
+  if (driver === "codex") return true;
+  return driver === "claudeAgent" && (window.id === "five_hour" || window.id === "seven_day");
+}
+
+export type ExhaustedUsageWindow = ServerProviderUsageWindow & { readonly resetsAt: string };
+
+/**
+ * The full window an instance waits on before any model can run again, or
+ * undefined while it has room. Of several full windows the one that resets
+ * last decides. A full window with no reset ahead decides nothing, and Claude
+ * extra usage with budget left keeps the account running past its limits.
+ */
+export function exhaustedUsageWindow(
+  provider: Pick<ServerProvider, "driver" | "usageLimits">,
+  nowMs: number,
+): ExhaustedUsageWindow | undefined {
+  const windows = provider.usageLimits?.windows ?? [];
+  if (
+    provider.driver === "claudeAgent" &&
+    windows.some((window) => window.id === "monthly_spend" && window.usedPercent < 100)
+  ) {
+    return undefined;
+  }
+  let exhausted: ExhaustedUsageWindow | undefined;
+  let exhaustedResetMs = nowMs;
+  for (const window of windows) {
+    const { resetsAt } = window;
+    if (
+      resetsAt === undefined ||
+      window.usedPercent < 100 ||
+      !stopsWholeAccount(provider.driver, window)
+    ) {
+      continue;
+    }
+    const resetMs = Date.parse(resetsAt);
+    if (resetMs > exhaustedResetMs) {
+      exhausted = { ...window, resetsAt };
+      exhaustedResetMs = resetMs;
+    }
+  }
+  return exhausted;
+}
+
 function poolMember(account: LimitAccount, reported: ServerProviderUsageWindow, now: number) {
   const spentWeekly =
     reported.kind === "session"
       ? account.limits.windows.find(
           (window) =>
+            window.kind === "weekly" &&
             window.usedPercent >= 100 &&
-            (account.driver === "claudeAgent"
-              ? window.id === "seven_day"
-              : account.driver === "codex" && window.kind === "weekly"),
+            stopsWholeAccount(account.driver, window),
         )
       : undefined;
   if (!spentWeekly) return { account, window: reported, refillPercent: reported.usedPercent };
